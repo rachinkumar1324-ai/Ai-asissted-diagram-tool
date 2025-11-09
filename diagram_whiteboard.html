@@ -1,0 +1,389 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AI-Assisted Collaborative Diagramming Tool</title>
+ 
+    <script src="https://cdn.tailwindcss.com"></script>
+   
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap');
+        body {
+            font-family: 'Inter', sans-serif;
+            background-color: #f4f7f9;
+        }
+        
+        #drawingCanvas {
+            box-shadow: 0 4px 6px -1px rgb(0 0 0 / 0.1), 0 2px 4px -2px rgb(0 0 0 / 0.1);
+            touch-action: none; 
+        }
+        .message-box {
+            position: fixed;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            z-index: 1000;
+        }
+    </style>
+</head>
+<body class="p-4 md:p-8">
+
+    <div class="max-w-6xl mx-auto">
+        <h1 class="text-3xl font-extrabold text-gray-900 mb-2">
+            AI Diagram Collab Tool
+        </h1>
+        <p class="text-gray-600 mb-6">
+            Draw your messy idea, and click "AI Clean Up" to instantly standardize it!
+        </p>
+
+        
+        <div class="flex flex-wrap gap-3 p-3 bg-white rounded-xl shadow-md mb-6">
+            <button id="drawButton" class="px-4 py-2 bg-indigo-600 text-white font-semibold rounded-lg shadow-md hover:bg-indigo-700 transition duration-150">
+                Draw (Mode: Live)
+            </button>
+            <button id="cleanupButton" class="px-4 py-2 bg-teal-500 text-white font-semibold rounded-lg shadow-md hover:bg-teal-600 transition duration-150">
+                AI Clean Up
+            </button>
+            <button id="clearButton" class="px-4 py-2 bg-red-500 text-white font-semibold rounded-lg shadow-md hover:bg-red-600 transition duration-150">
+                Clear Canvas
+            </button>
+            <span id="statusDisplay" class="p-2 text-sm font-medium text-gray-500 rounded-lg bg-gray-100 flex items-center">
+                Status: <span id="wsStatus" class="ml-1 font-bold text-red-500">Connecting...</span>
+            </span>
+        </div>
+
+        
+        <div class="relative bg-white rounded-xl overflow-hidden aspect-video">
+            <canvas id="drawingCanvas" class="w-full h-full bg-gray-50"></canvas>
+        </div>
+
+        
+        <div id="messageBox" class="message-box p-6 bg-white rounded-xl shadow-2xl transition duration-300 hidden">
+            <div id="loadingIndicator" class="flex items-center space-x-3">
+                <div class="animate-spin rounded-full h-6 w-6 border-b-2 border-indigo-600"></div>
+                <p class="text-indigo-600 font-semibold text-lg">Processing with AI...</p>
+            </div>
+            <p id="errorMessage" class="text-red-600 font-semibold text-lg hidden"></p>
+        </div>
+    </div>
+
+    <script>
+        
+        const CANVAS_VIRTUAL_SIZE = 1000; 
+        const WEBSOCKET_URL = `ws://127.0.0.1:8000/ws/drawing`;
+        const API_CLEANUP_URL = `http://127.0.0.1:8000/api/cleanup`;
+
+        const canvas = document.getElementById('drawingCanvas');
+        const ctx = canvas.getContext('2d');
+        const wsStatus = document.getElementById('wsStatus');
+        const messageBox = document.getElementById('messageBox');
+        const loadingIndicator = document.getElementById('loadingIndicator');
+        const errorMessage = document.getElementById('errorMessage');
+
+        let ws;
+        let isDrawing = false;
+        let lastX = 0;
+        let lastY = 0;
+        let scaleFactor = 1;
+        
+        const userId = 'user_' + Math.random().toString(36).substring(2, 9);
+        const myColor = '#' + Math.floor(Math.random()*16777215).toString(16); 
+        
+
+        function showLoading(show, error = false, message = "") {
+            messageBox.classList.remove('hidden');
+            if (show) {
+                loadingIndicator.classList.remove('hidden');
+                errorMessage.classList.add('hidden');
+            } else if (error) {
+                loadingIndicator.classList.add('hidden');
+                errorMessage.classList.remove('hidden');
+                errorMessage.textContent = message;
+                setTimeout(() => messageBox.classList.add('hidden'), 5000); 
+            } else {
+                messageBox.classList.add('hidden');
+            }
+        }
+
+       
+        
+        function resizeCanvas() {
+            
+            const container = canvas.parentElement;
+            const width = container.clientWidth;
+            const height = container.clientHeight;
+            canvas.width = width;
+            canvas.height = height;
+            scaleFactor = Math.min(width, height) / CANVAS_VIRTUAL_SIZE;
+            redrawHistory(); 
+        }
+
+        function getVirtualCoords(clientX, clientY) {
+            const rect = canvas.getBoundingClientRect();
+            const canvasX = clientX - rect.left;
+            const canvasY = clientY - rect.top;
+            
+            const virtualX = (canvasX / canvas.width) * CANVAS_VIRTUAL_SIZE;
+            const virtualY = (canvasY / canvas.height) * CANVAS_VIRTUAL_SIZE;
+
+            return { x: virtualX, y: virtualY };
+        }
+
+        function getActualCoords(virtualX, virtualY) {
+            const actualX = (virtualX / CANVAS_VIRTUAL_SIZE) * canvas.width;
+            const actualY = (virtualY / CANVAS_VIRTUAL_SIZE) * canvas.height;
+            return { x: actualX, y: actualY };
+        }
+
+
+        function drawLine(x1, y1, x2, y2, color, isLocal = false) {
+            const start = getActualCoords(x1, y1);
+            const end = getActualCoords(x2, y2);
+
+            ctx.beginPath();
+            ctx.moveTo(start.x, start.y);
+            ctx.lineTo(end.x, end.y);
+            ctx.strokeStyle = color;
+            ctx.lineWidth = isLocal ? 3 : 2; 
+            ctx.lineCap = 'round';
+            ctx.stroke();
+        }
+
+        function startDrawing(e) {
+            e.preventDefault();
+            isDrawing = true;
+            const clientX = e.touches ? e.touches[0].clientX : e.clientX;
+            const clientY = e.touches ? e.touches[0].clientY : e.clientY;
+
+            const { x, y } = getVirtualCoords(clientX, clientY);
+            lastX = x;
+            lastY = y;
+        }
+
+        function stopDrawing() {
+            isDrawing = false;
+        }
+
+        function draw(e) {
+            if (!isDrawing) return;
+            e.preventDefault();
+            const clientX = e.touches ? e.touches[0].clientX : e.clientX;
+            const clientY = e.touches ? e.touches[0].clientY : e.clientY;
+
+            const { x: newX, y: newY } = getVirtualCoords(clientX, clientY);
+            drawLine(lastX, lastY, newX, newY, myColor, true);
+
+            // Send to server for broadcast
+            if (ws && ws.readyState === WebSocket.OPEN) {
+                ws.send(JSON.stringify({
+                    type: 'drawing',
+                    data: {
+                        user: userId,
+                        color: myColor,
+                        x1: lastX,
+                        y1: lastY,
+                        x2: newX,
+                        y2: newY,
+                    }
+                }));
+            }
+
+            lastX = newX;
+            lastY = newY;
+        }
+
+        let drawingHistory = [];
+
+        function redrawHistory() {
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
+            
+            if (drawingHistory.length === 0) return;
+
+            drawingHistory.forEach(msg => {
+                if (msg.type === 'drawing') {
+                    const d = msg.data;
+                    drawLine(d.x1, d.y1, d.x2, d.y2, d.color, d.user === userId);
+                } else if (msg.type === 'cleanup') {
+                    renderCleanDiagram(msg.data.data, false); 
+                }
+            });
+        }
+
+        function handleIncomingMessage(msg) {
+            const data = JSON.parse(msg.data);
+            
+            if (data.type === 'history') {
+                drawingHistory = data.data;
+                redrawHistory();
+            } else if (data.type === 'drawing') {
+                drawingHistory.push(data);
+                const d = data.data;
+                drawLine(d.x1, d.y1, d.x2, d.y2, d.color, d.user === userId);
+            } else if (data.type === 'cleanup') {
+                drawingHistory = []; 
+                drawingHistory.push(data); 
+                
+                renderCleanDiagram(data.data.data, false); 
+            } else if (data.type === 'clear') {
+                
+                ctx.clearRect(0, 0, canvas.width, canvas.height);
+                drawingHistory = [];
+            }
+        }
+
+
+        function renderCleanDiagram(shapes, broadcastClear) {
+            ctx.clearRect(0, 0, canvas.width, canvas.height); 
+
+            shapes.forEach(shape => {
+                ctx.fillStyle = shape.color || '#374151'; 
+                ctx.strokeStyle = shape.color || '#374151'; 
+                ctx.lineWidth = 4;
+                
+                const d = shape.details;
+                
+                const p = (v) => (v / CANVAS_VIRTUAL_SIZE) * Math.min(canvas.width, canvas.height); 
+                
+                
+                const actualX = (v) => (v / CANVAS_VIRTUAL_SIZE) * canvas.width;
+                const actualY = (v) => (v / CANVAS_VIRTUAL_SIZE) * canvas.height;
+
+
+                switch (shape.type) {
+                    case 'rectangle':
+                        ctx.strokeRect(actualX(d.x), actualY(d.y), actualX(d.width), actualY(d.height));
+                        break;
+                    case 'circle':
+                        ctx.beginPath();
+                        ctx.arc(actualX(d.x), actualY(d.y), p(d.radius), 0, 2 * Math.PI);
+                        ctx.stroke();
+                        break;
+                    case 'line':
+                        drawLine(d.x1, d.y1, d.x2, d.y2, shape.color || '#374151', false);
+                        break;
+                    case 'text':
+                        ctx.font = `${Math.min(canvas.height, canvas.width) * 0.04}px 'Inter'`; 
+                        ctx.fillText(d.text, actualX(d.x), actualY(d.y));
+                        break;
+                }
+            });
+            
+            if (broadcastClear) {
+                if (ws && ws.readyState === WebSocket.OPEN) {
+                    ws.send(JSON.stringify({
+                        type: 'cleanup',
+                        data: {
+                            user: userId,
+                            data: shapes
+                        }
+                    }));
+                }
+            }
+        }
+        
+        async function handleAICleanup() {
+            showLoading(true);
+            const imageDataURL = canvas.toDataURL('image/png');
+            
+            try {
+                const response = await fetch(API_CLEANUP_URL, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ image_data_url: imageDataURL }),
+                });
+
+                const result = await response.json();
+
+                if (response.ok && result.status === 'success') {
+                    renderCleanDiagram(result.data, true); 
+                    
+                    drawingHistory = []; 
+                    drawingHistory.push({ type: 'cleanup', data: result }); 
+                    
+                    showLoading(false);
+                } else {
+                    const message = result.detail || "An unknown error occurred during AI processing.";
+                    showLoading(false, true, `AI Error: ${message}`);
+                }
+            } catch (error) {
+                console.error("Fetch/Network Error:", error);
+                showLoading(false, true, "Network error: Is the Python server running?");
+            }
+        }
+        
+        function handleClearCanvas() {
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
+            drawingHistory = []; 
+            if (ws && ws.readyState === WebSocket.OPEN) {
+                
+                ws.send(JSON.stringify({ type: 'clear' })); 
+            }
+        }
+
+       
+        
+        function connectWebSocket() {
+            ws = new WebSocket(WEBSOCKET_URL);
+
+            ws.onopen = () => {
+                wsStatus.textContent = 'Connected';
+                wsStatus.classList.remove('text-red-500', 'text-yellow-500');
+                wsStatus.classList.add('text-green-500');
+            };
+
+            ws.onmessage = handleIncomingMessage;
+
+            ws.onclose = () => {
+                wsStatus.textContent = 'Disconnected';
+                wsStatus.classList.remove('text-green-500');
+                wsStatus.classList.add('text-red-500');
+                // Attempt to reconnect after a delay
+                setTimeout(connectWebSocket, 3000); 
+            };
+
+            ws.onerror = (error) => {
+                console.error("WebSocket connection error. Ensure the Python server is running on http://127.0.0.1:8000.", error);
+                wsStatus.textContent = 'Error';
+                wsStatus.classList.remove('text-green-500');
+                wsStatus.classList.add('text-red-500');
+            };
+        }
+
+        // --- INITIALIZATION ---
+
+        function initializeApp() {
+             // Set up initial canvas size
+            resizeCanvas();
+
+            // Set up event listeners
+            canvas.addEventListener('mousedown', startDrawing);
+            canvas.addEventListener('mouseup', stopDrawing);
+            canvas.addEventListener('mouseout', stopDrawing);
+            canvas.addEventListener('mousemove', draw);
+            
+            // Touch support for mobile devices
+            canvas.addEventListener('touchstart', startDrawing);
+            canvas.addEventListener('touchend', stopDrawing);
+            canvas.addEventListener('touchcancel', stopDrawing);
+            canvas.addEventListener('touchmove', draw);
+
+            window.addEventListener('resize', resizeCanvas);
+            
+            document.getElementById('cleanupButton').addEventListener('click', handleAICleanup);
+            document.getElementById('clearButton').addEventListener('click', handleClearCanvas);
+
+            // Start the WebSocket connection
+            connectWebSocket();
+        }
+
+        // Attempt to initialize when the window finishes loading
+        window.onload = initializeApp;
+        
+        // Fallback: If window.onload fails (common with file:// protocol), try DOMContentLoaded
+        document.addEventListener('DOMContentLoaded', initializeApp);
+
+
+    </script>
+</body>
+</html>
